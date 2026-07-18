@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "attendance-system",
+  "compatibility_date": "2025-11-18",
+  "pages_build_output_dir": "./dist",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "attendance-db",
+      "database_id": "d399b293-e87c-4812-914d-456e0ec2b89e"
+    }
+  ],
+  "vars": {
+    "JWT_SECRET": "your-secret-key-change-in-production-min-32-chars-attendance-system-2025"
+  }
+}
