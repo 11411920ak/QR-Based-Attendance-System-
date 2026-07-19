@@ -472,7 +472,7 @@ app.get('/api/session/:sessionId/attendance', async (c) => {
       a.latitude,
       a.longitude,
       a.distance_meters,
-      a.marked_at
+      strftime('%Y-%m-%dT%H:%M:%SZ', a.marked_at) as marked_at
     FROM attendance a
     JOIN students s ON a.student_id = s.id
     WHERE a.session_id = ?
@@ -711,7 +711,7 @@ app.get('/api/student/attendance', async (c) => {
           c.name as class_name,
           c.code as class_code,
           t.name as teacher_name,
-          a.marked_at,
+          strftime('%Y-%m-%dT%H:%M:%SZ', a.marked_at) as marked_at,
           a.distance_meters
         FROM attendance a
         JOIN classes c ON a.class_id = c.id
@@ -836,11 +836,52 @@ app.post('/api/scan-qr', async (c) => {
         return c.json({ success: false, error: 'You have already marked your attendance' }, 400);
     }
 
-    // Mark attendance
+    // ── Face Token Validation (hard gate) ────────────────────────────────────
+    // A valid face_token is strictly required. It verifies the HMAC signature and expiry.
+    // Valid token = /api/face/verify already confirmed a server-side face match.
+    let verifiedByFace = 0;
+    const faceToken = body.face_token;
+    if (!faceToken) {
+        return c.json({ success: false, error: 'Face verification is strictly required to mark attendance.' }, 400);
+    }
+    try {
+        const parts = faceToken.split('.');
+        if (parts.length === 2) {
+            const payloadB64 = parts[0];
+            const sigB64 = parts[1];
+            const encoder = new TextEncoder();
+            const jwtSecret = (c.env && c.env.JWT_SECRET) ||
+                'your-secret-key-change-in-production-min-32-chars-attendance-system-2025';
+            const key = await crypto.subtle.importKey(
+                'raw',
+                encoder.encode(jwtSecret),
+                { name: 'HMAC', hash: 'SHA-256' },
+                false,
+                ['sign']
+            );
+            const expectedSig = await crypto.subtle.sign('HMAC', key, encoder.encode(payloadB64));
+            const expectedB64 = btoa(String.fromCharCode(...new Uint8Array(expectedSig)))
+                .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+            if (expectedB64 === sigB64) {
+                const tokenPayload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
+                if (tokenPayload.studentId === studentId && tokenPayload.exp > Date.now()) {
+                    verifiedByFace = 1;
+                }
+            }
+        }
+    } catch (_) {
+        // signature validation or parsing failed
+    }
+
+    if (verifiedByFace !== 1) {
+        return c.json({ success: false, error: 'Face verification is invalid or has expired. Please verify your face again.' }, 400);
+    }
+
+    // Mark attendance (includes verified_by_face audit flag)
     await DB.prepare(`
-    INSERT INTO attendance (session_id, student_id, class_id, latitude, longitude, distance_meters, device_fingerprint)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).bind(sessionId, studentId, session.class_id, latitude, longitude, distance, deviceFingerprint).run();
+    INSERT INTO attendance (session_id, student_id, class_id, latitude, longitude, distance_meters, device_fingerprint, verified_by_face)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(sessionId, studentId, session.class_id, latitude, longitude, distance, deviceFingerprint, verifiedByFace).run();
 
     // Record device scan
     await DB.prepare(`
@@ -872,7 +913,7 @@ app.get('/api/student/attendance', async (c) => {
       c.name as class_name,
       c.code as class_code,
       t.name as teacher_name,
-      a.marked_at,
+      strftime('%Y-%m-%dT%H:%M:%SZ', a.marked_at) as marked_at,
       a.distance_meters
     FROM attendance a
     JOIN classes c ON a.class_id = c.id
@@ -883,6 +924,161 @@ app.get('/api/student/attendance', async (c) => {
   `).bind(studentId).all();
 
     return c.json({ success: true, attendance: attendance.results });
+});
+
+// ==================== FACE VERIFICATION APIs ====================
+
+// Check if student has enrolled their face
+app.get('/api/face/status', async (c) => {
+    const { DB } = c.env;
+    const token = getCookie(c, 'student_token');
+    if (!token) return c.json({ success: false, error: 'Unauthorized' }, 401);
+    const payload = await verifyToken(token);
+    if (!payload || payload.role !== 'student') return c.json({ success: false, error: 'Unauthorized' }, 401);
+    const isValidSession = await verifySession(DB, token);
+    if (!isValidSession) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+    const studentId = await getStudentIdByUserId(DB, payload.userId);
+    if (!studentId) return c.json({ success: false, error: 'Student not found' }, 404);
+
+    const student = await DB.prepare(`
+        SELECT face_descriptor FROM students WHERE id = ?
+    `).bind(studentId).first();
+
+    return c.json({
+        success: true,
+        enrolled: !!(student && student.face_descriptor)
+    });
+});
+
+// Enroll a student's face
+app.post('/api/face/enroll', async (c) => {
+    const { DB } = c.env;
+    const token = getCookie(c, 'student_token');
+    if (!token) return c.json({ success: false, error: 'Unauthorized' }, 401);
+    const payload = await verifyToken(token);
+    if (!payload || payload.role !== 'student') return c.json({ success: false, error: 'Unauthorized' }, 401);
+    const isValidSession = await verifySession(DB, token);
+    if (!isValidSession) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+    const studentId = await getStudentIdByUserId(DB, payload.userId);
+    if (!studentId) return c.json({ success: false, error: 'Student not found' }, 404);
+
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ success: false, error: 'Invalid JSON' }, 400); }
+
+    const { descriptor } = body;
+
+    // Validate descriptor: must be exactly 128 finite floats
+    if (!Array.isArray(descriptor) || descriptor.length !== 128 ||
+        !descriptor.every((v) => typeof v === 'number' && isFinite(v))) {
+        return c.json({ success: false, error: 'Invalid face descriptor — must be 128 finite floats' }, 400);
+    }
+
+    // Rate-limit check: block re-enrollment within 60 seconds
+    const existing = await DB.prepare(`
+        SELECT face_enrolled_at FROM students WHERE id = ?
+    `).bind(studentId).first();
+
+    if (existing && existing.face_enrolled_at) {
+        const lastEnrolled = new Date(existing.face_enrolled_at as string).getTime();
+        if (Date.now() - lastEnrolled < 60_000) {
+            return c.json({ success: false, error: 'Please wait 60 seconds before re-enrolling your face.' }, 429);
+        }
+    }
+
+    const descriptorJson = JSON.stringify(descriptor);
+    const enrolledAt = new Date().toISOString();
+
+    await DB.prepare(`
+        UPDATE students SET face_descriptor = ?, face_enrolled_at = ? WHERE id = ?
+    `).bind(descriptorJson, enrolledAt, studentId).run();
+
+    return c.json({ success: true, message: 'Face enrolled successfully.' });
+});
+
+// Verify a student's face and return a HMAC face_token
+app.post('/api/face/verify', async (c) => {
+    const { DB } = c.env;
+    const token = getCookie(c, 'student_token');
+    if (!token) return c.json({ success: false, error: 'Unauthorized' }, 401);
+    const payload = await verifyToken(token);
+    if (!payload || payload.role !== 'student') return c.json({ success: false, error: 'Unauthorized' }, 401);
+    const isValidSession = await verifySession(DB, token);
+    if (!isValidSession) return c.json({ success: false, error: 'Unauthorized' }, 401);
+
+    const studentId = await getStudentIdByUserId(DB, payload.userId);
+    if (!studentId) return c.json({ success: false, error: 'Student not found' }, 404);
+
+    let body: any;
+    try { body = await c.req.json(); } catch { return c.json({ success: false, error: 'Invalid JSON' }, 400); }
+
+    const { descriptor } = body;
+
+    // Validate descriptor: must be exactly 128 finite floats
+    if (!Array.isArray(descriptor) || descriptor.length !== 128 ||
+        !descriptor.every((v) => typeof v === 'number' && isFinite(v))) {
+        return c.json({ success: false, error: 'Invalid face descriptor — must be 128 finite floats' }, 400);
+    }
+
+    // Retrieve enrolled face descriptor
+    const student = await DB.prepare(`
+        SELECT face_descriptor FROM students WHERE id = ?
+    `).bind(studentId).first();
+
+    if (!student || !student.face_descriptor) {
+        return c.json({ success: false, error: 'Face not enrolled. Please enroll your face first.' }, 400);
+    }
+
+    let enrolledDescriptor: number[];
+    try {
+        enrolledDescriptor = JSON.parse(student.face_descriptor as string);
+    } catch (e) {
+        return c.json({ success: false, error: 'Enrolled face data is corrupt.' }, 500);
+    }
+
+    if (!Array.isArray(enrolledDescriptor) || enrolledDescriptor.length !== 128) {
+        return c.json({ success: false, error: 'Enrolled face data is invalid.' }, 500);
+    }
+
+    // Euclidean distance calculation
+    let sumSquares = 0;
+    for (let i = 0; i < 128; i++) {
+        const diff = descriptor[i] - enrolledDescriptor[i];
+        sumSquares += diff * diff;
+    }
+    const distance = Math.sqrt(sumSquares);
+
+    // Threshold of 0.40 is standard/strict for face-api.js TinyFaceDetector + FaceLandmark68 + FaceRecognition
+    if (distance > 0.40) {
+        return c.json({ success: false, error: 'Face not recognized. Keep still and ensure proper lighting.' }, 400);
+    }
+
+    // Generate signed face_token
+    const exp = Date.now() + 5 * 60 * 1000; // 5 min expiry
+    const tokenPayload = { studentId, exp };
+    const payloadB64 = btoa(JSON.stringify(tokenPayload)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    const jwtSecret = (c.env && c.env.JWT_SECRET) ||
+        'your-secret-key-change-in-production-min-32-chars-attendance-system-2025';
+
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(jwtSecret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+    const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payloadB64));
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature)))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+    const faceToken = `${payloadB64}.${sigB64}`;
+
+    return c.json({
+        success: true,
+        face_token: faceToken
+    });
 });
 
 // ==================== WEB PAGES ====================
@@ -1573,6 +1769,8 @@ app.get('/student', (c) => {
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
         <!-- jsQR: reads QR from camera frames -->
         <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"><\/script>
+        <!-- face-api.js for face detection, landmark, and recognition (runs entirely in-browser) -->
+        <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"><\/script>
         <style>
             body {
                 font-family: 'Inter', sans-serif;
@@ -1626,6 +1824,18 @@ app.get('/student', (c) => {
             .scan-overlay { position:relative; }
             .scan-overlay::after { content:''; position:absolute; inset:0; border-radius:16px; border:3px solid rgba(16,185,129,0.6); pointer-events:none; box-shadow:inset 0 0 20px rgba(16,185,129,0.1); }
             .tag { display:inline-flex;align-items:center;gap:4px;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:600; }
+            /* Face verification gate */
+            #faceVideo { width:100%;max-height:220px;object-fit:cover;border-radius:14px;background:#0f172a; }
+            #faceCanvas { display:none; }
+            #enrollVideo { width:100%;max-height:220px;object-fit:cover;border-radius:14px;background:#0f172a; }
+            #enrollCanvas { display:none; }
+            .face-overlay { position:relative; }
+            .face-overlay::after { content:''; position:absolute;inset:0;border-radius:14px;border:2.5px solid rgba(16,185,129,0.5);pointer-events:none; }
+            .blink-ring { animation: blinkPulse 0.6s ease-out; }
+            @keyframes blinkPulse { 0%{border-color:rgba(251,191,36,0.9)} 100%{border-color:rgba(16,185,129,0.5)} }
+            /* Enrollment modal */
+            #enrollModal { position:fixed;inset:0;z-index:999;background:rgba(0,0,0,0.8);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center; }
+            #enrollModal.hidden { display:none; }
         </style>
     </head>
     <body class="min-h-screen text-slate-100" style="background:#080b14;font-family:'Inter',sans-serif;">
@@ -1672,43 +1882,113 @@ app.get('/student', (c) => {
                     </div>
                 </div>
 
-                <!-- QR Scanner -->
+                <!-- Face Verification Gate + QR Scanner -->
                 <div class="rounded-2xl p-6 md:col-span-2 flex flex-col justify-between glass-effect">
                     <div>
                         <h2 class="text-lg font-bold mb-3 flex items-center space-x-2" style="color:#f1f5f9;">
-                            <i class="fas fa-qrcode" style="color:#34d399;"></i>
-                            <span>Scan QR Code</span>
+                            <i class="fas fa-user-shield" style="color:#34d399;"></i>
+                            <span>Verify Identity & Scan QR</span>
                         </h2>
-                        <p class="text-sm mb-6 leading-relaxed" style="color:#64748b;">
-                            Point your camera at the teacher's QR code to mark attendance. Ensure you are physically present in the class.
+                        <p class="text-sm mb-4 leading-relaxed" style="color:#64748b;">
+                            First verify your identity with your face, then scan the teacher's QR code to mark attendance.
                         </p>
                     </div>
 
-                    <div id="cameraStatus" class="text-center py-6 text-sm text-slate-500" style="background:rgba(255,255,255,0.02);border:1px dashed rgba(255,255,255,0.1);border-radius:16px;">
-                        <i class="fas fa-camera text-3xl mb-3 block opacity-30"></i>
-                        Camera not started
+                    <!-- ── Step 1: Face Verification Gate ── -->
+                    <div id="faceGate">
+                        <!-- Loading face-api models -->
+                        <div id="faceLoading" class="text-center py-6 text-sm" style="color:#64748b;background:rgba(255,255,255,0.02);border:1px dashed rgba(255,255,255,0.1);border-radius:14px;">
+                            <i class="fas fa-spinner fa-spin text-2xl mb-2 block"></i>
+                            Loading face recognition models...
+                        </div>
+                        <!-- Camera view for face verification -->
+                        <div id="faceView" class="hidden">
+                           <div class="face-overlay mb-3" id="faceOverlay">
+                               <video id="faceVideo" autoplay playsinline muted></video>
+                               <canvas id="faceCanvas"></canvas>
+                           </div>
+                           <div id="faceStatus" class="text-center text-xs mb-3 font-semibold" style="color:#94a3b8;">
+                               <i class="fas fa-eye mr-1"></i> Look at the camera and blink once...
+                           </div>
+                           <div id="faceProgress" class="w-full h-1.5 rounded-full mb-3" style="background:rgba(255,255,255,0.08);">
+                               <div id="faceProgressBar" class="h-full rounded-full transition-all" style="width:0%;background:linear-gradient(90deg,#10b981,#06b6d4);"></div>
+                           </div>
+                        </div>
+                        <!-- Not enrolled prompt -->
+                        <div id="faceNotEnrolled" class="hidden text-center py-5" style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.2);border-radius:14px;">
+                            <i class="fas fa-face-smile-beam text-3xl mb-2" style="color:#fbbf24;"></i>
+                            <p class="text-sm font-bold mb-1" style="color:#fbbf24;">Face Not Enrolled</p>
+                            <p class="text-xs mb-3" style="color:#94a3b8;">Enroll your face once so we can verify it's really you before each attendance.</p>
+                            <button id="openEnrollBtn" class="text-xs font-bold px-4 py-2 rounded-xl transition" style="background:rgba(251,191,36,0.15);border:1px solid rgba(251,191,36,0.3);color:#fbbf24;">
+                                <i class="fas fa-camera mr-1"></i> Enroll My Face
+                            </button>
+                        </div>
+                        <!-- Face verified badge -->
+                        <div id="faceVerifiedBadge" class="hidden text-center py-3 mb-3 rounded-xl" style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);">
+                            <i class="fas fa-circle-check text-2xl mb-1" style="color:#34d399;"></i>
+                            <p class="text-sm font-bold" style="color:#34d399;">Identity Verified!</p>
+                            <p class="text-xs mt-0.5" style="color:#64748b;">Face matched — QR scanner is now active below.</p>
+                        </div>
                     </div>
 
-                    <div id="scannerWrap" class="scan-overlay hidden mb-4">
-                        <video id="scannerVideo" autoplay playsinline muted></video>
-                        <canvas id="scanCanvas" class="hidden"></canvas>
+                    <!-- ── Step 2: QR Scanner (shown after face verified) ── -->
+                    <div id="qrGate" class="hidden mt-4">
+                        <div class="border-t mb-4" style="border-color:rgba(255,255,255,0.08);"></div>
+                        <h3 class="text-sm font-bold mb-3 flex items-center gap-2" style="color:#f1f5f9;">
+                            <i class="fas fa-qrcode" style="color:#34d399;"></i> Scan QR Code
+                        </h3>
+                        <div id="cameraStatus" class="text-center py-6 text-sm text-slate-500" style="background:rgba(255,255,255,0.02);border:1px dashed rgba(255,255,255,0.1);border-radius:16px;">
+                            <i class="fas fa-camera text-3xl mb-3 block opacity-30"></i>
+                            Camera not started
+                        </div>
+                        <div id="scannerWrap" class="scan-overlay hidden mb-4">
+                            <video id="scannerVideo" autoplay playsinline muted></video>
+                            <canvas id="scanCanvas" class="hidden"></canvas>
+                        </div>
+                        <div id="scanResult" class="hidden rounded-xl p-4 text-sm font-medium text-center mb-4"></div>
+                        <div class="flex gap-3 mt-4">
+                            <button id="startCameraBtn" class="pulse-button flex-1 bg-gradient-to-r from-emerald-500 to-teal-600 text-white py-3.5 rounded-xl font-bold text-sm shadow-lg shadow-emerald-500/20 hover:-translate-y-0.5 transition-all flex items-center justify-center gap-2">
+                                <i class="fas fa-camera"></i> Start Camera
+                            </button>
+                            <button id="stopCameraBtn" class="hidden flex-1 border border-rose-500/50 text-rose-400 py-3 rounded-xl font-bold text-sm hover:bg-rose-500/10 transition flex items-center justify-center gap-2">
+                                <i class="fas fa-stop"></i> Stop
+                            </button>
+                        </div>
+                        <p class="text-center text-xs mt-4 flex items-center justify-center gap-1.5" style="color:#64748b;">
+                            <i class="fas fa-map-marker-alt text-rose-400"></i>
+                            Location is required to verify you're within 80m of the classroom.
+                        </p>
                     </div>
+                </div>
+            </div>
 
-                    <div id="scanResult" class="hidden rounded-xl p-4 text-sm font-medium text-center mb-4"></div>
-
-                    <div class="flex gap-3 mt-4">
-                        <button id="startCameraBtn" class="pulse-button flex-1 bg-gradient-to-r from-emerald-500 to-teal-600 text-white py-3.5 rounded-xl font-bold text-sm shadow-lg shadow-emerald-500/20 hover:shadow-emerald-500/35 hover:-translate-y-0.5 transition-all flex items-center justify-center gap-2">
-                            <i class="fas fa-camera"></i> Start Camera
+            <!-- Face Enrollment Modal -->
+            <div id="enrollModal" class="hidden">
+                <div class="rounded-2xl p-6 w-full max-w-md mx-4" style="background:#0f172a;border:1px solid rgba(255,255,255,0.1);">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-lg font-bold text-white flex items-center gap-2">
+                            <i class="fas fa-camera-retro" style="color:#34d399;"></i> Enroll Your Face
+                        </h3>
+                        <button id="closeEnrollModal" class="text-slate-400 hover:text-white transition">
+                            <i class="fas fa-times text-lg"></i>
                         </button>
-                        <button id="stopCameraBtn" class="hidden flex-1 border border-rose-500/50 text-rose-400 py-3 rounded-xl font-bold text-sm hover:bg-rose-500/10 transition flex items-center justify-center gap-2">
-                            <i class="fas fa-stop"></i> Stop
-                        </button>
                     </div>
-
-                    <p class="text-center text-xs mt-4 flex items-center justify-center gap-1.5" style="color:#64748b;">
-                        <i class="fas fa-map-marker-alt text-rose-400"></i>
-                        Location is required to verify you're within 80m of the classroom.
+                    <p class="text-sm mb-4" style="color:#64748b;">
+                        Face enrollment is a one-time step. Your face descriptor (128 numbers) is stored securely — never a photo.
                     </p>
+                    <div class="face-overlay mb-3">
+                        <video id="enrollVideo" autoplay playsinline muted></video>
+                        <canvas id="enrollCanvas"></canvas>
+                    </div>
+                    <div id="enrollStatus" class="text-center text-xs mb-3 font-semibold" style="color:#94a3b8;">
+                       <i class="fas fa-spinner fa-spin mr-1"></i> Position your face clearly in the frame...
+                    </div>
+                    <div id="enrollProgress" class="w-full h-2 rounded-full mb-4" style="background:rgba(255,255,255,0.08);">
+                        <div id="enrollProgressBar" class="h-full rounded-full transition-all" style="width:0%;background:linear-gradient(90deg,#10b981,#06b6d4);"></div>
+                    </div>
+                    <button id="enrollCaptureBtn" class="w-full py-3 rounded-xl font-bold text-sm text-white transition" style="background:linear-gradient(135deg,#10b981,#06b6d4);opacity:0.5;cursor:not-allowed;" disabled>
+                        <i class="fas fa-check-circle mr-1"></i> Capture & Enroll Face
+                    </button>
                 </div>
             </div>
 
@@ -1728,17 +2008,334 @@ app.get('/student', (c) => {
         </div>
 
         <script>
+            // ── Global State ─────────────────────────────────────────────────────
             let studentData = null;
             let stream = null;
             let scanInterval = null;
             let scanning = false;
             let scanCooldown = false;
 
+            // face-api state
+            let faceModelsLoaded = false;
+            let faceStream = null;
+            let faceToken = null;          // short-lived HMAC token from /api/face/verify
+            let blinkDetected = false;
+            let faceVerified = false;
+            let prevEAR = 1.0;             // previous eye aspect ratio (for blink detection)
+            let faceCheckInterval = null;
+
+            // enrollment state
+            let enrollStream = null;
+            let enrollDescriptors = [];    // collected descriptors for averaging
+
             // Persistent client ID for device fingerprinting
             if (!localStorage.getItem('clientId')) {
                 localStorage.setItem('clientId', crypto.randomUUID ? crypto.randomUUID() : (Math.random().toString(36).slice(2) + Date.now()));
             }
             const clientId = localStorage.getItem('clientId');
+
+            // ── Face API Helpers ──────────────────────────────────────────────────
+            // Eye Aspect Ratio (EAR): low value = eye closed = blink
+            function eyeAspectRatio(eye) {
+                // eye = array of 6 landmark points {x,y}
+                const A = Math.hypot(eye[1].x - eye[5].x, eye[1].y - eye[5].y);
+                const B = Math.hypot(eye[2].x - eye[4].x, eye[2].y - eye[4].y);
+                const C = Math.hypot(eye[0].x - eye[3].x, eye[0].y - eye[3].y);
+                return (A + B) / (2.0 * C);
+            }
+
+            // Load face-api models from CDN
+            async function loadFaceModels() {
+                const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+                try {
+                    await Promise.all([
+                        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+                        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+                        faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+                    ]);
+                    faceModelsLoaded = true;
+                    return true;
+                } catch (err) {
+                    console.error('Failed to load face-api models:', err);
+                    return false;
+                }
+            }
+
+            // ── Face Verification Gate ────────────────────────────────────────────
+            async function startFaceGate() {
+                // Stop any existing stream and interval to avoid duplication/overlapping
+                stopFaceCamera();
+
+                document.getElementById('faceLoading').classList.remove('hidden');
+                document.getElementById('faceView').classList.add('hidden');
+                document.getElementById('faceNotEnrolled').classList.add('hidden');
+
+                // Check face enrollment status
+                let enrolled = false;
+                try {
+                    const statusRes = await axios.get('/api/face/status');
+                    enrolled = statusRes.data.enrolled;
+                } catch (e) { enrolled = false; }
+
+                if (!enrolled) {
+                    document.getElementById('faceLoading').classList.add('hidden');
+                    document.getElementById('faceNotEnrolled').classList.remove('hidden');
+                    return;
+                }
+
+                // Load models if not yet loaded
+                if (!faceModelsLoaded) {
+                    const ok = await loadFaceModels();
+                    if (!ok) {
+                        document.getElementById('faceLoading').innerHTML =
+                            '<i class="fas fa-exclamation-triangle text-rose-400 text-2xl mb-2 block"></i>' +
+                            '<p class="text-xs text-rose-400">Failed to load face models. Face verification is strictly required.</p>';
+                        return;
+                    }
+                }
+
+                // Start face camera
+                try {
+                    faceStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'user', width: 320, height: 240 },
+                        audio: false
+                    });
+                    const vid = document.getElementById('faceVideo');
+                    vid.srcObject = faceStream;
+                    await vid.play();
+                } catch (err) {
+                    document.getElementById('faceLoading').innerHTML =
+                        '<i class="fas fa-camera-slash text-rose-400 text-2xl mb-2 block"></i>' +
+                        '<p class="text-xs text-rose-400">Camera permission denied. Face verification is strictly required.</p>';
+                    return;
+                }
+
+                document.getElementById('faceLoading').classList.add('hidden');
+                document.getElementById('faceView').classList.remove('hidden');
+
+                // Start detection loop
+                blinkDetected = false;
+                prevEAR = 1.0;
+                let detectCount = 0;
+                const BLINK_EAR_THRESHOLD = 0.22;
+                const BLINK_EAR_CONSEC = 1; // 1 frame at 150ms is highly responsive and catches normal blinks
+                let earBelowCount = 0;
+                let bestDescriptor = null;
+                let progressFrames = 0;
+
+                function runFaceDetection() {
+                    if (faceCheckInterval) clearInterval(faceCheckInterval);
+                    faceCheckInterval = setInterval(async () => {
+                        if (faceVerified) { clearInterval(faceCheckInterval); return; }
+                        const vid = document.getElementById('faceVideo');
+                        if (!vid || vid.readyState < 2) return;
+
+                        const detection = await faceapi
+                            .detectSingleFace(vid, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.15 }))
+                            .withFaceLandmarks()
+                            .withFaceDescriptor();
+
+                        if (!detection) {
+                            document.getElementById('faceStatus').innerHTML =
+                                '<i class="fas fa-face-meh mr-1 text-amber-400"></i> No face detected. Move closer.';
+                            return;
+                        }
+
+                        // Update progress
+                        progressFrames = Math.min(progressFrames + 1, 10);
+                        document.getElementById('faceProgressBar').style.width = (progressFrames * 10) + '%';
+
+                        if (progressFrames < 10) {
+                            document.getElementById('faceStatus').innerHTML =
+                                '<i class="fas fa-smile mr-1 text-emerald-400"></i> Face detected! Keeping still... (' + (progressFrames * 10) + '%)';
+                        } else if (!blinkDetected) {
+                            document.getElementById('faceStatus').innerHTML =
+                                '<i class="fas fa-eye mr-1 text-emerald-400"></i> Face detected! Blink your eyes once to verify.';
+                        }
+
+                        // Blink detection via eye landmarks
+                        const lm = detection.landmarks;
+                        const leftEye = lm.getLeftEye();
+                        const rightEye = lm.getRightEye();
+                        const ear = (eyeAspectRatio(leftEye) + eyeAspectRatio(rightEye)) / 2;
+
+                        if (ear < BLINK_EAR_THRESHOLD) {
+                            earBelowCount++;
+                        } else if (earBelowCount >= BLINK_EAR_CONSEC) {
+                            // Blink completed
+                            blinkDetected = true;
+                            earBelowCount = 0;
+                            document.getElementById('faceOverlay').classList.add('blink-ring');
+                            setTimeout(() => document.getElementById('faceOverlay').classList.remove('blink-ring'), 600);
+                            document.getElementById('faceStatus').innerHTML =
+                                '<i class="fas fa-eye mr-1 text-emerald-400"></i> Blink detected! Verifying face...';
+                        } else {
+                            earBelowCount = 0;
+                        }
+
+                        bestDescriptor = Array.from(detection.descriptor);
+
+                        // Trigger verification ONLY on blink (liveness check is mandatory)
+                        if (blinkDetected && bestDescriptor) {
+                            clearInterval(faceCheckInterval);
+                            document.getElementById('faceStatus').innerHTML =
+                                '<i class="fas fa-spinner fa-spin mr-1"></i> Verifying with server...';
+                            document.getElementById('faceProgressBar').style.width = '100%';
+                            await serverVerifyFace(bestDescriptor, runFaceDetection);
+                        }
+                    }, 150); // Checks every 150ms to ensure normal human blinks are captured reliably
+                }
+
+                runFaceDetection();
+            }
+
+            async function serverVerifyFace(descriptor, retryCallback) {
+                try {
+                    const res = await axios.post('/api/face/verify', { descriptor });
+                    if (res.data.success && res.data.face_token) {
+                        faceToken = res.data.face_token;
+                        faceVerified = true;
+                        stopFaceCamera();
+                        document.getElementById('faceView').classList.add('hidden');
+                        document.getElementById('faceVerifiedBadge').classList.remove('hidden');
+                        document.getElementById('qrGate').classList.remove('hidden');
+                    } else {
+                        document.getElementById('faceStatus').innerHTML =
+                            '<i class="fas fa-circle-xmark mr-1 text-rose-400"></i> ' + (res.data.error || 'Face not matched') + ' — try again.';
+                        
+                        // Reset liveness tracking variables
+                        blinkDetected = false;
+                        progressFrames = 0;
+                        earBelowCount = 0;
+                        document.getElementById('faceProgressBar').style.width = '0%';
+
+                        // Wait 2.5s to let user read error message before restarting detection loop
+                        setTimeout(() => {
+                            if (!faceVerified && typeof retryCallback === 'function') {
+                                retryCallback();
+                            }
+                        }, 2500);
+                    }
+                } catch (e) {
+                    document.getElementById('faceStatus').innerHTML =
+                        '<i class="fas fa-wifi-slash mr-1 text-rose-400"></i> Verification failed. Face verification is strictly required.';
+                    stopFaceCamera();
+                }
+            }
+
+            function stopFaceCamera() {
+                if (faceCheckInterval) { clearInterval(faceCheckInterval); faceCheckInterval = null; }
+                if (faceStream) { faceStream.getTracks().forEach(t => t.stop()); faceStream = null; }
+            }
+
+            // ── Face Enrollment Modal ─────────────────────────────────────────────
+            document.getElementById('openEnrollBtn').addEventListener('click', openEnrollModal);
+            document.getElementById('closeEnrollModal').addEventListener('click', closeEnrollModal);
+
+            async function openEnrollModal() {
+                document.getElementById('enrollModal').classList.remove('hidden');
+                enrollDescriptors = [];
+                document.getElementById('enrollProgressBar').style.width = '0%';
+                document.getElementById('enrollStatus').innerHTML =
+                    '<i class="fas fa-spinner fa-spin mr-1"></i> Starting camera...';
+                document.getElementById('enrollCaptureBtn').disabled = true;
+                document.getElementById('enrollCaptureBtn').style.opacity = '0.5';
+                document.getElementById('enrollCaptureBtn').style.cursor = 'not-allowed';
+
+                if (!faceModelsLoaded) {
+                    document.getElementById('enrollStatus').innerHTML =
+                        '<i class="fas fa-spinner fa-spin mr-1"></i> Loading face models (first time only)...';
+                    await loadFaceModels();
+                }
+
+                try {
+                    enrollStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'user', width: 320, height: 240 },
+                        audio: false
+                    });
+                    const vid = document.getElementById('enrollVideo');
+                    vid.srcObject = enrollStream;
+                    await vid.play();
+                    startEnrollDetection();
+                } catch (err) {
+                    document.getElementById('enrollStatus').innerHTML =
+                        '<i class="fas fa-camera-slash text-rose-400 mr-1"></i> Camera access denied.';
+                }
+            }
+
+            function closeEnrollModal() {
+                stopEnrollCamera();
+                document.getElementById('enrollModal').classList.add('hidden');
+            }
+
+            function stopEnrollCamera() {
+                if (enrollStream) { enrollStream.getTracks().forEach(t => t.stop()); enrollStream = null; }
+            }
+
+            let enrollDetectInterval = null;
+
+            function startEnrollDetection() {
+                enrollDescriptors = [];
+                const TARGET = 5; // capture 5 frames and average
+                enrollDetectInterval = setInterval(async () => {
+                    const vid = document.getElementById('enrollVideo');
+                    if (!vid || vid.readyState < 2) return;
+                    const detection = await faceapi
+                        .detectSingleFace(vid, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.15 }))
+                        .withFaceLandmarks()
+                        .withFaceDescriptor();
+                    if (!detection) {
+                        document.getElementById('enrollStatus').innerHTML =
+                            '<i class="fas fa-face-meh mr-1 text-amber-400"></i> No face detected. Move closer.';
+                        return;
+                    }
+                    enrollDescriptors.push(Array.from(detection.descriptor));
+                    const pct = Math.round((enrollDescriptors.length / TARGET) * 100);
+                    document.getElementById('enrollProgressBar').style.width = pct + '%';
+                    document.getElementById('enrollStatus').innerHTML =
+                        '<i class="fas fa-circle-notch fa-spin mr-1 text-emerald-400"></i> Capturing face (' + enrollDescriptors.length + '/' + TARGET + ')...';
+
+                    if (enrollDescriptors.length >= TARGET) {
+                        clearInterval(enrollDetectInterval);
+                        // Average descriptors for robustness
+                        const avgDesc = enrollDescriptors[0].map((_, i) =>
+                            enrollDescriptors.reduce((sum, d) => sum + d[i], 0) / enrollDescriptors.length
+                        );
+                        document.getElementById('enrollStatus').innerHTML =
+                            '<i class="fas fa-check-circle text-emerald-400 mr-1"></i> Face captured! Click to enroll.';
+                        const btn = document.getElementById('enrollCaptureBtn');
+                        btn.disabled = false;
+                        btn.style.opacity = '1';
+                        btn.style.cursor = 'pointer';
+                        btn.onclick = () => submitEnrollment(avgDesc);
+                    }
+                }, 400);
+            }
+
+            async function submitEnrollment(descriptor) {
+                document.getElementById('enrollStatus').innerHTML =
+                    '<i class="fas fa-spinner fa-spin mr-1"></i> Enrolling...';
+                try {
+                    const res = await axios.post('/api/face/enroll', { descriptor });
+                    if (res.data.success) {
+                        document.getElementById('enrollStatus').innerHTML =
+                            '<i class="fas fa-circle-check text-emerald-400 mr-1"></i> Face enrolled successfully!';
+                        setTimeout(() => {
+                            closeEnrollModal();
+                            // Restart face gate now that student is enrolled
+                            document.getElementById('faceNotEnrolled').classList.add('hidden');
+                            startFaceGate();
+                        }, 1500);
+                    } else {
+                        document.getElementById('enrollStatus').innerHTML =
+                            '<i class="fas fa-circle-xmark text-rose-400 mr-1"></i> ' + (res.data.error || 'Enrollment failed');
+                    }
+                } catch (e) {
+                    document.getElementById('enrollStatus').innerHTML =
+                        '<i class="fas fa-circle-xmark text-rose-400 mr-1"></i> ' +
+                        (e.response?.data?.error || 'Enrollment failed. Try again.');
+                }
+            }
 
             // ── Auth check ────────────────────────────────────────────────────────
             async function checkAuth() {
@@ -1836,7 +2433,8 @@ app.get('/student', (c) => {
                             qrData,
                             latitude: pos.coords.latitude,
                             longitude: pos.coords.longitude,
-                            clientId
+                            clientId,
+                            face_token: faceToken  // HMAC-signed token from /api/face/verify
                         });
                         if (res.data.success) {
                             showResult('<i class="fas fa-check-circle mr-2"></i>Attendance marked! ' + (res.data.class?.name || ''), true);
@@ -1897,7 +2495,10 @@ app.get('/student', (c) => {
             }
 
             // ── Init ──────────────────────────────────────────────────────────────
-            checkAuth();
+            checkAuth().then(() => {
+                // Start face verification gate after auth confirms student identity
+                startFaceGate();
+            });
         <\/script>
     </body>
     </html>
