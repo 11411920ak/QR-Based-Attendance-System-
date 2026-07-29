@@ -2,7 +2,7 @@
 
 ## Project Overview
 - **Name**: Smart College Attendance System
-- **Goal**: Create an intelligent QR code-based attendance tracking system for colleges with location validation and anti-fraud measures
+- **Goal**: An intelligent QR code-based attendance tracking system for colleges with location validation and anti-fraud measures
 - **Features**: 
   - QR code generation with 5-minute time limit
   - 80-meter radius geolocation validation
@@ -10,11 +10,12 @@
   - Real-time attendance monitoring
   - Teacher and student dashboards
 
-## URLs
-- **Local Development**: https://3000-ifcxiotwstypq3ttd2pvp-c81df28e.sandbox.novita.ai
-- **Teacher Dashboard**: https://3000-ifcxiotwstypq3ttd2pvp-c81df28e.sandbox.novita.ai/teacher
-- **Student Dashboard**: https://3000-ifcxiotwstypq3ttd2pvp-c81df28e.sandbox.novita.ai/student
-- **Production**: (To be deployed to Cloudflare Pages as `attendance-system`)
+## 🌐 Live Deployment
+- **Production URL**: [https://attendance-system-bn8.pages.dev](https://attendance-system-bn8.pages.dev)
+- **Teacher Dashboard**: [https://attendance-system-bn8.pages.dev/teacher](https://attendance-system-bn8.pages.dev/teacher)
+- **Student Dashboard**: [https://attendance-system-bn8.pages.dev/student](https://attendance-system-bn8.pages.dev/student)
+- **Platform**: Cloudflare Pages
+- **Status**: ✅ Live and fully functional
 
 ## System Features
 
@@ -127,7 +128,7 @@
 - **Device Scans**: Anti-fraud device tracking (id, session_id, device_fingerprint, student_id, scanned_at)
 
 ### Storage Services
-- **Cloudflare D1**: SQLite-based database for all relational data
+- **Cloudflare D1**: SQLite-based database for all relational data (production)
 - **Local Development**: Uses `--local` flag for offline SQLite database in `.wrangler/state/v3/d1`
 
 ### Data Flow
@@ -139,7 +140,7 @@
 ## User Guide
 
 ### For Teachers
-1. **Access Teacher Dashboard**: Go to `/teacher` (https://3000-ifcxiotwstypq3ttd2pvp-c81df28e.sandbox.novita.ai/teacher)
+1. **Access Teacher Dashboard**: Go to [attendance-system-bn8.pages.dev/teacher](https://attendance-system-bn8.pages.dev/teacher)
 2. **Select Class**: Choose from your assigned classes (CS301, CS302, CS303)
 3. **Generate QR Code**: Click "Generate QR Code" - allow location access when prompted
 4. **Display QR**: Show the generated QR code on smart board/projector for students to scan
@@ -147,7 +148,7 @@
 6. **Stop Session**: Click "Stop Session" when class ends (or wait 5 minutes for auto-expiry)
 
 ### For Students
-1. **Access Student Dashboard**: Go to `/student` (https://3000-ifcxiotwstypq3ttd2pvp-c81df28e.sandbox.novita.ai/student)
+1. **Access Student Dashboard**: Go to [attendance-system-bn8.pages.dev/student](https://attendance-system-bn8.pages.dev/student)
 2. **Select Student**: Choose your profile from dropdown (demo mode)
 3. **Start Scanner**: Click "Start QR Scanner" - allow camera and location access
 4. **Scan QR Code**: Point camera at the QR code displayed in classroom
@@ -172,10 +173,10 @@
 ### Current Status
 - **Platform**: Cloudflare Pages
 - **Development Status**: ✅ Fully functional locally
-- **Production Status**: ⏳ Ready for deployment (requires Cloudflare API key setup)
-- **Database**: Cloudflare D1 (local SQLite for development)
+- **Production Status**: ✅ Deployed and live at [attendance-system-bn8.pages.dev](https://attendance-system-bn8.pages.dev)
+- **Database**: Cloudflare D1
 - **Tech Stack**: Hono + TypeScript + TailwindCSS + D1 Database
-- **Project Name**: `attendance-system` (stored in meta_info)
+- **Project Name**: `attendance-system`
 
 ### Local Development
 ```bash
@@ -220,35 +221,16 @@ npm run db:console:local
 # Then run SQL: SELECT * FROM students;
 ```
 
-### Deployment to Cloudflare Pages
-
-**IMPORTANT: Before deployment, you must set up your Cloudflare API key in the Deploy tab.**
-
+### Redeploying to Cloudflare Pages
 ```bash
-# 1. Setup Cloudflare API key (REQUIRED FIRST)
-# Go to Deploy tab and configure your API key
-
-# 2. Create production D1 database
-npx wrangler d1 create attendance-db
-
-# 3. Update wrangler.jsonc with the database_id from step 2
-
-# 4. Apply migrations to production database
+# 1. Apply migrations to production database (if schema changed)
 npm run db:migrate:prod
 
-# 5. (Optional) Seed production database
-wrangler d1 execute attendance-db --file=./seed.sql
-
-# 6. Create Cloudflare Pages project
-npx wrangler pages project create attendance-system \
-  --production-branch main \
-  --compatibility-date 2025-11-18
-
-# 7. Deploy to production
+# 2. Deploy latest changes to production
 npm run deploy:prod
 
-# 8. Verify deployment
-curl https://attendance-system.pages.dev
+# 3. Verify deployment
+curl https://attendance-system-bn8.pages.dev
 ```
 
 ## Security Features
@@ -300,27 +282,22 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 - Touch-friendly buttons and controls
 
 ## Recommended Next Steps
-1. **Deploy to Production**
-   - Set up Cloudflare API key in Deploy tab
-   - Create production D1 database
-   - Deploy to Cloudflare Pages
-
-2. **Implement Authentication**
+1. **Implement Authentication**
    - Add JWT-based login system
    - Implement password hashing with bcrypt
    - Add session management
 
-3. **Mobile App**
+2. **Mobile App**
    - Convert to Progressive Web App (PWA)
    - Add offline capability with service workers
    - Implement push notifications
 
-4. **Enhanced Analytics**
+3. **Enhanced Analytics**
    - Add detailed reporting dashboard
    - Implement CSV/PDF export functionality
    - Create attendance trend charts
 
-5. **Bulk Management**
+4. **Bulk Management**
    - Implement bulk student enrollment
    - Add class schedule management
    - Create admin panel for system configuration
@@ -346,11 +323,10 @@ webapp/
 ```
 
 ## Last Updated
-November 18, 2025 - Complete system implementation with all core features
+July 29, 2026 - Live deployment on Cloudflare Pages
 - ✅ Full CRUD operations for attendance tracking
 - ✅ QR code generation and scanning
 - ✅ Geolocation validation
 - ✅ Device fingerprinting
 - ✅ Real-time monitoring dashboards
-- ✅ Local development with PM2 and D1 local mode
-- ⏳ Ready for Cloudflare Pages deployment
+- ✅ Deployed to production at attendance-system-bn8.pages.dev
