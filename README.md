@@ -1,4 +1,4 @@
-# Smart College Attendance System
+# AttendGuard – Multi-Layer Anti-Proxy Attendance System
 
 ## Project Overview
 - **Name**: Smart College Attendance System
